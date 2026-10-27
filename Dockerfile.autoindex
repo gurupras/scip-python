@@ -1,4 +1,4 @@
-FROM nikolaik/python-nodejs:python3.11-nodejs24-alpine@sha256:2db8a57a186758d0ca8412eb0571916a384de05f3e7d08585fe540e4eb2600df
+FROM nikolaik/python-nodejs:python3.11-nodejs24-alpine@sha256:0a6ba943622d10fb2d67b4a900bc07898bb79f87dbe9478fa6ed2a4c2581c3ec
 
 # ca-certificates 20261020-r0 distrusts the compromised eMudhra intermediates;
 # the base image ships an older version.
