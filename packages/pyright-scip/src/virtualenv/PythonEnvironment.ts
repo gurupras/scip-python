@@ -39,7 +39,7 @@ export default class PythonEnvironment {
         // that is probably worth it as an optimization later.
 
         let packageIndex = this._moduleNameToIndex.get(moduleName);
-        if (!packageIndex) {
+        if (packageIndex === undefined) {
             const moduleNameWithInit = moduleName + '.__init__';
 
             // TODO: This should be formalized much better and I would think this
@@ -60,7 +60,7 @@ export default class PythonEnvironment {
                     }
                 }
 
-                if (packageIndex) {
+                if (packageIndex !== undefined) {
                     break;
                 }
             }
