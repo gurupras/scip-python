@@ -1067,14 +1067,11 @@ export class TreeVisitor extends ParseTreeWalker {
                 }
 
                 const namePart = node.nameParts[0];
-                if (Hardcoded.stdlib_module_names.has(namePart.value)) {
+                if (node.leadingDots === 0 && Hardcoded.stdlib_module_names.has(namePart.value)) {
                     pythonPackage = this.stdlibPackage;
                 }
 
-                return Symbols.makeModuleInit(
-                    pythonPackage,
-                    node.nameParts.map((namePart) => namePart.value).join('.')
-                );
+                return Symbols.makeModuleInit(pythonPackage, this.absoluteModuleName(node));
             }
             case ParseNodeType.MemberAccess: {
                 softAssert(false, 'Not supposed to get a member access');
@@ -1123,7 +1120,13 @@ export class TreeVisitor extends ParseTreeWalker {
                                 const bound = typeVar.details.boundType! as ClassType;
 
                                 return this.getSymbolOnce(node, () => {
-                                    const pythonPackage = this.getPackageInfo(node, bound.details.moduleName)!;
+                                    const pythonPackage = this.guessPackage(
+                                        bound.details.moduleName,
+                                        bound.details.filePath
+                                    );
+                                    if (!pythonPackage) {
+                                        return ScipSymbol.local(this.counter.next());
+                                    }
                                     let symbol = Symbols.makeTerm(
                                         Symbols.makeType(
                                             Symbols.makeModule(pythonPackage, bound.details.moduleName),
@@ -1207,7 +1210,16 @@ export class TreeVisitor extends ParseTreeWalker {
             case ParseNodeType.ImportFrom: {
                 const importPackage = this.moduleNameNodeToPythonPackage(node.module);
                 if (!importPackage) {
-                    return this.getScipSymbol(node.module);
+                    // NOTE(scip-python): an import with no package used to fall back to the
+                    // referencing file's package, stamping an unresolved module as a project module.
+                    const importInfo = getImportInfo(node.module);
+                    const reason =
+                        importInfo && importInfo.isImportFound
+                            ? 'unable to resolve package'
+                            : 'unable to resolve module';
+                    return this.getLocalForDeclaration(node.module, [
+                        `(module): ${_formatModuleName(node.module)} [${reason}]`,
+                    ]);
                 }
 
                 return this.makeScipSymbol(importPackage, _formatModuleName(node.module), node.module);
@@ -1238,12 +1250,15 @@ export class TreeVisitor extends ParseTreeWalker {
 
                             switch (parent.nodeType) {
                                 case ParseNodeType.ImportFrom: {
-                                    const pythonPackage =
-                                        this.moduleNameNodeToPythonPackage(parent.module) || this.projectPackage;
+                                    const pythonPackage = this.moduleNameNodeToPythonPackage(parent.module);
+                                    if (!pythonPackage) {
+                                        return ScipSymbol.local(this.counter.next());
+                                    }
 
+                                    const moduleName = this.absoluteModuleName(parent.module);
                                     return Symbols.makeModuleInit(
                                         pythonPackage,
-                                        [...parent.module.nameParts, node.name].map((part) => part.value).join('.')
+                                        moduleName ? `${moduleName}.${node.name.value}` : node.name.value
                                     );
                                 }
                             }
@@ -1343,7 +1358,12 @@ export class TreeVisitor extends ParseTreeWalker {
             }
             return this.getFunctionSymbol(decl);
         } else if (Types.isClass(typeObj)) {
-            const pythonPackage = this.getPackageInfo(node, typeObj.details.moduleName)!;
+            // NOTE(scip-python): getPackageInfo answers for the referencing file, which
+            // stamped a dependency's class re-exported into a project file as the project's.
+            const pythonPackage = this.guessPackage(typeObj.details.moduleName, typeObj.details.filePath);
+            if (!pythonPackage) {
+                return ScipSymbol.local(this.counter.next());
+            }
             return Symbols.makeClass(pythonPackage, typeObj.details.moduleName, node.value);
         } else if (Types.isClassInstance(typeObj)) {
             typeObj = typeObj as ClassType;
@@ -1352,7 +1372,10 @@ export class TreeVisitor extends ParseTreeWalker {
         } else if (Types.isTypeVar(typeObj)) {
             throw 'typevar';
         } else if (Types.isModule(typeObj)) {
-            const pythonPackage = this.getPackageInfo(node, typeObj.moduleName)!;
+            const pythonPackage = this.guessPackage(typeObj.moduleName, typeObj.filePath);
+            if (!pythonPackage) {
+                return ScipSymbol.local(this.counter.next());
+            }
             return Symbols.makeModuleInit(pythonPackage, typeObj.moduleName);
         } else if (Types.isOverloadedFunction(typeObj)) {
             if (!typeObj.overloads) {
@@ -1617,17 +1640,52 @@ export class TreeVisitor extends ParseTreeWalker {
         node: ModuleNameNode,
         decl: Declaration | undefined = undefined
     ): PythonPackage | undefined {
-        // If it has leading dots, then we know it's from this package
+        // If it has leading dots, then it's from the package of the importing file
         if (node.leadingDots > 0) {
-            return this.projectPackage;
+            return this.getPackageInfo(node, getFileInfo(node).moduleName);
         }
 
         if (node.nameParts.length === 0) {
             softAssert(false, 'how can this be?', node);
         }
 
+        // NOTE(scip-python): with no declaration, the import's own resolved file decides,
+        // so a resolved project module is the project's and an unresolved one is no one's.
+        const importInfo = getImportInfo(node);
+        let declPath = decl ? decl.path : undefined;
+        if (!declPath && importInfo && importInfo.isImportFound) {
+            declPath = importInfo.resolvedPaths.filter((p) => p.length > 0).pop();
+        }
+
         const declModuleName = _formatModuleName(node);
-        return this.guessPackage(declModuleName, decl ? decl.path : undefined);
+        const pythonPackage = this.guessPackage(declModuleName, declPath);
+        if (pythonPackage) {
+            return pythonPackage;
+        }
+
+        if (importInfo && importInfo.isImportFound && importInfo.isStdlibTypeshedFile) {
+            return this.stdlibPackage;
+        }
+
+        return undefined;
+    }
+
+    // The absolute name of the module a ModuleName node refers to:
+    // `from ..c import g` in pkg/sub/d.py refers to pkg.c.
+    private absoluteModuleName(node: ModuleNameNode): string {
+        const nameParts = node.nameParts.map((namePart) => namePart.value);
+        if (node.leadingDots === 0) {
+            return nameParts.join('.');
+        }
+
+        const fileInfo = getFileInfo(node);
+        let base = fileInfo.moduleName.split('.').filter((part) => part.length > 0);
+        if (!path.basename(fileInfo.filePath).startsWith('__init__.')) {
+            base = base.slice(0, -1);
+        }
+        base = base.slice(0, Math.max(0, base.length - (node.leadingDots - 1)));
+
+        return [...base, ...nameParts].join('.');
     }
 
     public guessPackage(moduleName: string, declPath: string | undefined = undefined): PythonPackage | undefined {
